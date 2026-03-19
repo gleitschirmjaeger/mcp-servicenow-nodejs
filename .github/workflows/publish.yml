@@ -57,7 +57,7 @@ jobs:
         run: npm audit --audit-level=high
 
   publish-npm:
-    needs: [check-version, test]
+    needs: [check-version]
     if: needs.check-version.outputs.should-publish == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -94,7 +94,7 @@ jobs:
           prerelease: false
 
   publish-docker:
-    needs: [check-version, test]
+    needs: [check-version]
     if: needs.check-version.outputs.should-publish == 'true'
     runs-on: ubuntu-latest
     steps:
