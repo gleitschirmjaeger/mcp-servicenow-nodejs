@@ -95,7 +95,6 @@ jobs:
 
   publish-docker:
     needs: [check-version]
-    if: needs.check-version.outputs.should-publish == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
