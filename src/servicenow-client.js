@@ -47,15 +47,34 @@ export class ServiceNowClient {
       this.currentInstanceName = instanceName;
     }
 
-    this.client = axios.create({
-      baseURL: this.instanceUrl,
-      headers: {
-        'Authorization': `Basic ${this.auth}`,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
-      }
-    });
+    this._buildClient();
   }
+
+  // NEW: switch to Bearer token auth
+setAccessToken(token) {
+  this.accessToken = token;
+  this._buildClient();
+}
+
+// NEW: clear token, fall back to Basic
+clearAccessToken() {
+  this.accessToken = null;
+  this._buildClient();
+}
+
+// NEW: extracted so both setInstance() and setAccessToken() can call it
+_buildClient() {
+  this.client = axios.create({
+    baseURL: this.instanceUrl,
+    headers: {
+      'Authorization': this.accessToken
+        ? `Bearer ${this.accessToken}`
+        : `Basic ${this.auth}`,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
+    }
+  });
+}
 
   /**
    * Get current instance information
