@@ -1,3 +1,10 @@
+/**
+ * ServiceNow MCP Server - Express HTTP Server
+ *
+ * Copyright (c) 2025 Happy Technologies LLC
+ * Licensed under the MIT License - see LICENSE file for details
+ */
+
 import express from 'express';
 import dotenv from 'dotenv';
 import axios from 'axios';
@@ -6,24 +13,29 @@ import { ServiceNowClient } from './servicenow-client.js';
 import { createMcpServer } from './mcp-server-consolidated.js';
 import { configManager } from './config-manager.js';
 
+// Load environment variables
 dotenv.config();
 
+// SSE configuration
 const SSE_KEEPALIVE_INTERVAL = parseInt(process.env.SSE_KEEPALIVE_INTERVAL || '15000', 10);
 
 const app = express();
 app.use(express.json());
 
-// In-memory session store (sessionId -> {server, transport, client})
+// In-memory session store (sessionId -> {server, transport, client, keepaliveInterval})
 const sessions = {};
 
-// In-memory OAuth token store (state -> token data), single-use
+// In-memory OAuth pending store (state -> {code, created_at}), single-use
 const pendingTokens = new Map();
 
+// Get default instance configuration
 const defaultInstance = configManager.getDefaultInstance();
 console.log(`🔗 Default ServiceNow instance: ${defaultInstance.name} (${defaultInstance.url})`);
+console.log(`💡 Use SN-Set-Instance tool to switch instances during session`);
 
 /**
- * Helper: create a fresh ServiceNowClient for a session
+ * Create a fresh ServiceNowClient for a session.
+ * If a Bearer token is provided it will be used instead of Basic Auth.
  */
 function createClient(bearerToken = null) {
   const client = new ServiceNowClient(
@@ -38,14 +50,64 @@ function createClient(bearerToken = null) {
   return client;
 }
 
+// ---------------------------------------------------------------------------
+// OAuth routes
+// ---------------------------------------------------------------------------
+
 /**
- * GET /oauth/callback - ServiceNow redirects here after user authorizes
+ * GET /oauth/callback
+ * ServiceNow redirects here after the user authorizes the OAuth app.
+ * We store the authorization code keyed by state, then signal the opener
+ * popup to close via postMessage. The token exchange happens separately
+ * once the client POSTs the PKCE code_verifier.
  */
-app.get('/oauth/callback', async (req, res) => {
+app.get('/oauth/callback', (req, res) => {
   const { code, state } = req.query;
 
   if (!code || !state) {
     return res.status(400).send('Missing code or state parameter');
+  }
+
+  // Store code — token exchange happens when client POSTs code_verifier
+  pendingTokens.set(state, {
+    code,
+    created_at: Date.now()
+  });
+
+  // Auto-expire entries after 5 minutes to avoid memory leaks
+  setTimeout(() => pendingTokens.delete(state), 5 * 60 * 1000);
+
+  // Close the popup and notify the opener
+  res.send(`
+    <html><body><script>
+      window.opener.postMessage(
+        { type: 'SN_OAUTH_SUCCESS', state: '${state}' },
+        '*'
+      );
+      window.close();
+    </script></body></html>
+  `);
+});
+
+/**
+ * POST /oauth/token/:state
+ * The browser POSTs the PKCE code_verifier here after the popup closes.
+ * We complete the authorization code + PKCE token exchange with ServiceNow
+ * and return the access token to the caller.
+ * Single-use: the pending entry is deleted immediately after retrieval.
+ */
+app.post('/oauth/token/:state', async (req, res) => {
+  const pending = pendingTokens.get(req.params.state);
+  if (!pending) {
+    return res.status(404).json({ error: 'Token not found or already consumed' });
+  }
+
+  // Single-use — delete immediately
+  pendingTokens.delete(req.params.state);
+
+  const { code_verifier } = req.body;
+  if (!code_verifier) {
+    return res.status(400).json({ error: 'Missing code_verifier' });
   }
 
   try {
@@ -53,55 +115,38 @@ app.get('/oauth/callback', async (req, res) => {
       `${defaultInstance.url}/oauth_token.do`,
       new URLSearchParams({
         grant_type:    'authorization_code',
-        code,
+        code:          pending.code,
         client_id:     process.env.SN_OAUTH_CLIENT_ID,
         client_secret: process.env.SN_OAUTH_CLIENT_SECRET,
-        redirect_uri:  process.env.SN_OAUTH_REDIRECT_URI
+        redirect_uri:  process.env.SN_OAUTH_REDIRECT_URI,
+        code_verifier                          // PKCE verifier
       }),
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
     );
 
-    pendingTokens.set(state, {
-      access_token:  response.data.access_token,
-      refresh_token: response.data.refresh_token,
-      expires_in:    response.data.expires_in,
-      created_at:    Date.now()
+    res.json({
+      access_token: response.data.access_token,
+      expires_in:   response.data.expires_in
     });
-
-    // Close the popup and signal success back to the opener window
-    res.send(`
-      <html><body><script>
-        window.opener.postMessage(
-          { type: 'SN_OAUTH_SUCCESS', state: '${state}' },
-          '${defaultInstance.url}'
-        );
-        window.close();
-      </script></body></html>
-    `);
   } catch (err) {
-    console.error('❌ OAuth callback error:', err.message);
-    res.status(500).send('OAuth token exchange failed: ' + err.message);
+    console.error('❌ Token exchange error:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Token exchange failed: ' + err.message });
   }
 });
 
-/**
- * GET /oauth/token/:state - Single-use token retrieval after popup closes
- */
-app.get('/oauth/token/:state', (req, res) => {
-  const token = pendingTokens.get(req.params.state);
-  if (!token) {
-    return res.status(404).json({ error: 'Token not found or already consumed' });
-  }
-  pendingTokens.delete(req.params.state); // Single-use — delete after retrieval
-  res.json({ access_token: token.access_token, expires_in: token.expires_in });
-});
+// ---------------------------------------------------------------------------
+// MCP routes
+// ---------------------------------------------------------------------------
 
 /**
- * GET /mcp - Establish SSE connection
- * Extracts Bearer token from Authorization header if present
+ * GET /mcp - Establish SSE connection.
+ * If an Authorization: Bearer <token> header is present the session will
+ * use that token for all ServiceNow API calls (acting as that user).
+ * Otherwise falls back to the configured service-account Basic Auth.
  */
 app.get('/mcp', async (req, res) => {
   try {
+    // SSE headers — prevent buffering and timeouts
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('X-Accel-Buffering', 'no');
     res.setHeader('Connection', 'keep-alive');
@@ -114,23 +159,24 @@ app.get('/mcp', async (req, res) => {
       ? authHeader.slice(7)
       : null;
 
-    // Create a per-session client (with or without OAuth token)
+    // Each session gets its own client so tokens are fully isolated
     const sessionClient = createClient(bearerToken);
 
     if (bearerToken) {
-      console.log(`🔐 Session using OAuth Bearer token`);
+      console.log(`🔐 New session using OAuth Bearer token`);
     } else {
-      console.log(`🔑 Session using Basic Auth (service account)`);
+      console.log(`🔑 New session using Basic Auth (service account)`);
     }
 
     const transport = new SSEServerTransport('/mcp', res);
     const server = await createMcpServer(sessionClient);
 
+    // Keepalive heartbeat — prevents proxy/load-balancer timeouts
     const keepaliveInterval = setInterval(() => {
       try {
         res.write(': keepalive\n\n');
       } catch (error) {
-        console.error('❌ Keepalive failed:', error.message);
+        console.error('❌ Keepalive failed, clearing interval:', error.message);
         clearInterval(keepaliveInterval);
       }
     }, SSE_KEEPALIVE_INTERVAL);
@@ -170,7 +216,7 @@ app.get('/mcp', async (req, res) => {
 });
 
 /**
- * POST /mcp - Handle JSON-RPC messages
+ * POST /mcp - Handle JSON-RPC messages for an existing session.
  */
 app.post('/mcp', async (req, res) => {
   try {
@@ -189,17 +235,20 @@ app.post('/mcp', async (req, res) => {
   }
 });
 
-// Health check
+// ---------------------------------------------------------------------------
+// Utility routes
+// ---------------------------------------------------------------------------
+
 app.get('/health', (req, res) => {
   res.json({
     status: 'healthy',
     servicenow_instance: defaultInstance.url,
     instance_name: defaultInstance.name,
+    active_sessions: Object.keys(sessions).length,
     timestamp: new Date().toISOString()
   });
 });
 
-// List instances
 app.get('/instances', (req, res) => {
   try {
     const instances = configManager.listInstances();
@@ -209,12 +258,21 @@ app.get('/instances', (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Start
+// ---------------------------------------------------------------------------
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 ServiceNow MCP Server listening on port ${PORT}`);
-  console.log(`📊 Health check: http://localhost:${PORT}/health`);
-  console.log(`🔌 MCP SSE endpoint: http://localhost:${PORT}/mcp`);
-  console.log(`📋 Available instances: http://localhost:${PORT}/instances`);
-  console.log(`🔐 OAuth callback: http://localhost:${PORT}/oauth/callback`);
-  console.log(`💓 SSE keepalive interval: ${SSE_KEEPALIVE_INTERVAL}ms`);
+  console.log(`🚀 Gleitschirmjaeger ServiceNow MCP Server listening on port ${PORT}`);
+  console.log(`📊 Health check:       http://localhost:${PORT}/health`);
+  console.log(`🔌 MCP SSE endpoint:   http://localhost:${PORT}/mcp`);
+  console.log(`📋 Instances:          http://localhost:${PORT}/instances`);
+  console.log(`🔐 OAuth callback:     http://localhost:${PORT}/oauth/callback`);
+  console.log(`💓 SSE keepalive:      ${SSE_KEEPALIVE_INTERVAL}ms`);
+
+  if (process.env.DEBUG === 'true') {
+    console.log('🐛 Debug mode enabled');
+    console.log(`🔗 Active instance: ${defaultInstance.name} - ${defaultInstance.url}`);
+  }
 });
