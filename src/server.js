@@ -1,75 +1,140 @@
-/**
- * ServiceNow MCP Server - Express HTTP Server
- *
- * Copyright (c) 2025 Happy Technologies LLC
- * Licensed under the MIT License - see LICENSE file for details
- */
-
 import express from 'express';
 import dotenv from 'dotenv';
+import axios from 'axios';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { ServiceNowClient } from './servicenow-client.js';
 import { createMcpServer } from './mcp-server-consolidated.js';
 import { configManager } from './config-manager.js';
 
-// Load environment variables
 dotenv.config();
 
-// SSE configuration
-const SSE_KEEPALIVE_INTERVAL = parseInt(process.env.SSE_KEEPALIVE_INTERVAL || '15000', 10); // Default: 15 seconds
+const SSE_KEEPALIVE_INTERVAL = parseInt(process.env.SSE_KEEPALIVE_INTERVAL || '15000', 10);
 
 const app = express();
 app.use(express.json());
 
-// In-memory session store (sessionId -> {server, transport})
+// In-memory session store (sessionId -> {server, transport, client})
 const sessions = {};
 
-// Get default instance configuration
+// In-memory OAuth token store (state -> token data), single-use
+const pendingTokens = new Map();
+
 const defaultInstance = configManager.getDefaultInstance();
 console.log(`🔗 Default ServiceNow instance: ${defaultInstance.name} (${defaultInstance.url})`);
-console.log(`💡 Use SN-Set-Instance tool to switch instances during session`);
 
-// Create ServiceNow client with default instance
-const serviceNowClient = new ServiceNowClient(
-  defaultInstance.url,
-  defaultInstance.username,
-  defaultInstance.password
-);
-serviceNowClient.currentInstanceName = defaultInstance.name;
+/**
+ * Helper: create a fresh ServiceNowClient for a session
+ */
+function createClient(bearerToken = null) {
+  const client = new ServiceNowClient(
+    defaultInstance.url,
+    defaultInstance.username,
+    defaultInstance.password
+  );
+  client.currentInstanceName = defaultInstance.name;
+  if (bearerToken) {
+    client.setAccessToken(bearerToken);
+  }
+  return client;
+}
+
+/**
+ * GET /oauth/callback - ServiceNow redirects here after user authorizes
+ */
+app.get('/oauth/callback', async (req, res) => {
+  const { code, state } = req.query;
+
+  if (!code || !state) {
+    return res.status(400).send('Missing code or state parameter');
+  }
+
+  try {
+    const response = await axios.post(
+      `${defaultInstance.url}/oauth_token.do`,
+      new URLSearchParams({
+        grant_type:    'authorization_code',
+        code,
+        client_id:     process.env.SN_OAUTH_CLIENT_ID,
+        client_secret: process.env.SN_OAUTH_CLIENT_SECRET,
+        redirect_uri:  process.env.SN_OAUTH_REDIRECT_URI
+      }),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+
+    pendingTokens.set(state, {
+      access_token:  response.data.access_token,
+      refresh_token: response.data.refresh_token,
+      expires_in:    response.data.expires_in,
+      created_at:    Date.now()
+    });
+
+    // Close the popup and signal success back to the opener window
+    res.send(`
+      <html><body><script>
+        window.opener.postMessage(
+          { type: 'SN_OAUTH_SUCCESS', state: '${state}' },
+          '${defaultInstance.url}'
+        );
+        window.close();
+      </script></body></html>
+    `);
+  } catch (err) {
+    console.error('❌ OAuth callback error:', err.message);
+    res.status(500).send('OAuth token exchange failed: ' + err.message);
+  }
+});
+
+/**
+ * GET /oauth/token/:state - Single-use token retrieval after popup closes
+ */
+app.get('/oauth/token/:state', (req, res) => {
+  const token = pendingTokens.get(req.params.state);
+  if (!token) {
+    return res.status(404).json({ error: 'Token not found or already consumed' });
+  }
+  pendingTokens.delete(req.params.state); // Single-use — delete after retrieval
+  res.json({ access_token: token.access_token, expires_in: token.expires_in });
+});
 
 /**
  * GET /mcp - Establish SSE connection
+ * Extracts Bearer token from Authorization header if present
  */
 app.get('/mcp', async (req, res) => {
   try {
-    // SSE-specific headers to prevent buffering and timeouts
     res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
+    res.setHeader('X-Accel-Buffering', 'no');
     res.setHeader('Connection', 'keep-alive');
-
-    // Disable timeout for SSE endpoint (0 = infinite)
     req.setTimeout(0);
     res.setTimeout(0);
 
-    // Create transport and start SSE connection
+    // Extract Bearer token if provided
+    const authHeader = req.headers['authorization'];
+    const bearerToken = authHeader?.startsWith('Bearer ')
+      ? authHeader.slice(7)
+      : null;
+
+    // Create a per-session client (with or without OAuth token)
+    const sessionClient = createClient(bearerToken);
+
+    if (bearerToken) {
+      console.log(`🔐 Session using OAuth Bearer token`);
+    } else {
+      console.log(`🔑 Session using Basic Auth (service account)`);
+    }
+
     const transport = new SSEServerTransport('/mcp', res);
+    const server = await createMcpServer(sessionClient);
 
-    // Create and configure new MCP server instance
-    const server = await createMcpServer(serviceNowClient);
-
-    // Set up keepalive heartbeat to prevent connection timeout
-    // Send a comment every N seconds to keep connection alive
     const keepaliveInterval = setInterval(() => {
       try {
-        // Send SSE comment (starts with :) to keep connection alive
         res.write(': keepalive\n\n');
       } catch (error) {
-        console.error('❌ Keepalive failed, clearing interval:', error.message);
+        console.error('❌ Keepalive failed:', error.message);
         clearInterval(keepaliveInterval);
       }
     }, SSE_KEEPALIVE_INTERVAL);
 
-    // Set up transport cleanup
     transport.onclose = () => {
       if (sessions[transport.sessionId]) {
         clearInterval(keepaliveInterval);
@@ -78,7 +143,6 @@ app.get('/mcp', async (req, res) => {
       }
     };
 
-    // Clean up on request close/error
     req.on('close', () => {
       clearInterval(keepaliveInterval);
       if (sessions[transport.sessionId]) {
@@ -92,11 +156,9 @@ app.get('/mcp', async (req, res) => {
       clearInterval(keepaliveInterval);
     });
 
-    // Store the session
-    sessions[transport.sessionId] = { server, transport, keepaliveInterval };
+    sessions[transport.sessionId] = { server, transport, keepaliveInterval, client: sessionClient };
     console.log(`🔗 New session established: ${transport.sessionId}`);
 
-    // connect() starts the transport automatically in current MCP SDK
     await server.connect(transport);
 
   } catch (error) {
@@ -115,13 +177,10 @@ app.post('/mcp', async (req, res) => {
     const sessionId = req.query.sessionId;
 
     if (!sessionId || !sessions[sessionId]) {
-      return res.status(400).json({
-        error: 'Invalid or missing session ID'
-      });
+      return res.status(400).json({ error: 'Invalid or missing session ID' });
     }
 
     const { transport } = sessions[sessionId];
-    // express.json() already consumed the stream, so pass parsed body
     await transport.handlePostMessage(req, res, req.body);
 
   } catch (error) {
@@ -130,7 +189,7 @@ app.post('/mcp', async (req, res) => {
   }
 });
 
-// Health check endpoint
+// Health check
 app.get('/health', (req, res) => {
   res.json({
     status: 'healthy',
@@ -140,7 +199,7 @@ app.get('/health', (req, res) => {
   });
 });
 
-// List available instances endpoint
+// List instances
 app.get('/instances', (req, res) => {
   try {
     const instances = configManager.listInstances();
@@ -150,17 +209,12 @@ app.get('/instances', (req, res) => {
   }
 });
 
-// Start the server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 ServiceNow MCP Server listening on port ${PORT}`);
   console.log(`📊 Health check: http://localhost:${PORT}/health`);
   console.log(`🔌 MCP SSE endpoint: http://localhost:${PORT}/mcp`);
   console.log(`📋 Available instances: http://localhost:${PORT}/instances`);
+  console.log(`🔐 OAuth callback: http://localhost:${PORT}/oauth/callback`);
   console.log(`💓 SSE keepalive interval: ${SSE_KEEPALIVE_INTERVAL}ms`);
-
-  if (process.env.DEBUG === 'true') {
-    console.log('🐛 Debug mode enabled');
-    console.log(`🔗 Active ServiceNow instance: ${defaultInstance.name} - ${defaultInstance.url}`);
-  }
 });
